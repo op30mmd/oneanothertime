@@ -1,0 +1,186 @@
+name: Download and Chunk File
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: 'URLs to download (one per line, or comma-separated)'
+        required: true
+        type: string
+      dest_dir:
+        description: 'Directory to store the chunks'
+        required: true
+        default: 'downloads'
+      skip_cleanup:
+        description: 'skip cleanup step for small files'
+        required: true
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  download-chunk-commit:
+    runs-on: ubuntu-latest
+    steps:
+      # FIX 1: Delete heavy tools we do not need. This gives ~30 GB of free space!
+      - name: Free Runner Disk Space
+        if: ${{ inputs.skip_cleanup == false }}
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 157286400
+          git config http.lowSpeedLimit 1000
+          git config http.lowSpeedTime 300
+
+      - name: Download, compress, split, and push chunk by chunk
+        run: |
+          mkdir -p "${{ inputs.dest_dir }}"
+
+          MANIFEST_FILE="${{ inputs.dest_dir }}/integrity.sha256"
+          > "$MANIFEST_FILE"
+
+          URLS=$(echo "${{ inputs.file_urls }}" | tr ',' '\n' | sed '/^[[:space:]]*$/d')
+
+          while IFS= read -r URL; do
+            URL=$(echo "$URL" | xargs)
+            [ -z "$URL" ] && continue
+
+            ORIGINAL_FILENAME=$(basename "$URL")
+            ORIGINAL_FILENAME="${ORIGINAL_FILENAME%%\?*}"
+            [ -z "$ORIGINAL_FILENAME" ] && ORIGINAL_FILENAME="downloaded_file"
+            
+            # Add .gz because we will compress it
+            FILENAME="${ORIGINAL_FILENAME}.gz"
+
+            echo "--- Downloading: $URL"
+            curl -L --retry 5 --retry-delay 10 "$URL" -o "/tmp/$ORIGINAL_FILENAME"
+
+            # FIX 2: Compress the file to make it much smaller before splitting
+            echo "--- Compressing to save space..."
+            gzip "/tmp/$ORIGINAL_FILENAME"
+            # Now the file is named /tmp/$FILENAME
+
+            # Hash the compressed file
+            HASH=$(sha256sum "/tmp/$FILENAME" | awk '{print $1}')
+            echo "$HASH  $FILENAME" >> "$MANIFEST_FILE"
+            echo "SHA256($FILENAME) = $HASH"
+
+            echo "--- Splitting into 99MB chunks..."
+            split -b 99M -d "/tmp/$FILENAME" "${{ inputs.dest_dir }}/${FILENAME}.part."
+
+            # Delete the temp file now to save runner space
+            rm "/tmp/$FILENAME"
+
+            # Hash each chunk and push
+            for CHUNK in "${{ inputs.dest_dir }}/${FILENAME}".part.*; do
+              CHUNK_HASH=$(sha256sum "$CHUNK" | awk '{print $1}')
+              CHUNK_NAME=$(basename "$CHUNK")
+              echo "$CHUNK_HASH  $CHUNK_NAME" >> "$MANIFEST_FILE"
+              
+              git add "$CHUNK"
+              git commit -m "chunk: $CHUNK_NAME"
+
+              # Retry push up to 5 times
+              for ATTEMPT in 1 2 3 4 5; do
+                if git push; then
+                  break
+                else
+                  echo "Push attempt $ATTEMPT failed, pulling and retrying..."
+                  git pull --rebase
+                  sleep 10
+                  if [ "$ATTEMPT" -eq 5 ]; then
+                    echo "ERROR: Failed to push $CHUNK_NAME"
+                    exit 1
+                  fi
+                fi
+              done
+              echo "Pushed: $CHUNK_NAME"
+            done
+            
+            # FIX 3: Tell Git to clean up its local memory so it doesn't crash
+            git gc --auto
+
+          done <<< "$URLS"
+
+      - name: Generate verify and reassembly script
+        run: |
+          cat > "${{ inputs.dest_dir }}/verify_and_reassemble.sh" << 'EOF'
+          #!/usr/bin/env bash
+          set -e
+          MANIFEST="integrity.sha256"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: $MANIFEST not found."
+            exit 1
+          fi
+
+          echo "=== Checking parts ==="
+          FAILED=0
+          while IFS= read -r LINE; do
+            EXPECTED_HASH=$(echo "$LINE" | awk '{print $1}')
+            FILE=$(echo "$LINE" | awk '{print $2}')
+            [[ "$FILE" != *.part.* ]] && continue
+            if [ ! -f "$FILE" ]; then
+              echo "MISSING: $FILE"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
+            ACTUAL_HASH=$(sha256sum "$FILE" | awk '{print $1}')
+            if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+              echo "CORRUPTED: $FILE"
+              FAILED=$((FAILED + 1))
+            fi
+          done < "$MANIFEST"
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "ERROR: $FAILED file(s) are broken. Stop."
+            exit 1
+          fi
+
+          echo "=== Putting parts together ==="
+          BASE_NAMES=$(grep '\.part\.' "$MANIFEST" | awk '{print $2}' \
+            | sed 's/\.part\.[0-9]*$//' | sort -u)
+
+          while IFS= read -r BASE; do
+            [ -z "$BASE" ] && continue
+            echo "Building: $BASE"
+            cat "${BASE}".part.* > "$BASE"
+            
+            # Check the combined file
+            EXPECTED=$(grep "  $BASE$" "$MANIFEST" | awk '{print $1}')
+            if [ -n "$EXPECTED" ]; then
+              ACTUAL=$(sha256sum "$BASE" | awk '{print $1}')
+              if [ "$ACTUAL" == "$EXPECTED" ]; then
+                echo "OK: $BASE"
+                echo "Unzipping back to normal..."
+                gunzip "$BASE"
+              else
+                echo "ERROR: Hash is wrong after building."
+                exit 1
+              fi
+            fi
+          done <<< "$BASE_NAMES"
+
+          echo "All done!"
+          EOF
+          chmod +x "${{ inputs.dest_dir }}/verify_and_reassemble.sh"
+
+          git add "${{ inputs.dest_dir }}/integrity.sha256" \
+                  "${{ inputs.dest_dir }}/verify_and_reassemble.sh"
+          git commit -m "Add manifest and script"
+          git push

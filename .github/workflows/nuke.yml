@@ -1,0 +1,46 @@
+name: Factory Reset (Wipe repo, keep workflows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type "NUKE" to confirm you want to wipe everything but workflows'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  wipe-repository-keep-workflows:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.confirmation == 'NUKE' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reset history and files, preserve workflows
+        run: |
+          # Configure Git as the GitHub Actions Bot
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 1. Save the current commit ID before we destroy anything
+          OLD_HEAD=$(git rev-parse HEAD)
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          
+          # 2. Create an orphan branch (a branch with a completely blank history)
+          git checkout --orphan clean_history_branch
+          
+          # 3. Remove EVERY file from Git tracking and delete them from the disk
+          git rm -rf .
+          
+          # 4. Magically restore ONLY the .github/workflows/ directory from the old commit
+          git checkout $OLD_HEAD -- .github/workflows/ README.md
+          
+          # 5. Commit the workflows to this new, clean history
+          git commit -m "Factory reset: Wiped all files and history, preserved workflows"
+          
+          echo "Force pushing clean history over $DEFAULT_BRANCH..."
+          
+          # 6. Force push this clean branch to replace the default branch on GitHub
+          git push -f origin clean_history_branch:$DEFAULT_BRANCH
